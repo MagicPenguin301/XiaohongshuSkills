@@ -92,14 +92,14 @@ python scripts/chrome_launcher.py --kill
 python scripts/publish_pipeline.py --headless \
     --title "文章标题" \
     --content "文章正文" \
-    --image-urls "https://example.com/image.jpg"
+    --image-urls "https://upload.wikimedia.org/wikipedia/commons/7/70/Example.png"
 
 # 有窗口预览模式（仅填充，不自动点发布）
 python scripts/publish_pipeline.py \
     --preview \
     --title "文章标题" \
     --content "文章正文" \
-    --image-urls "https://example.com/image.jpg"
+    --image-urls "https://upload.wikimedia.org/wikipedia/commons/7/70/Example.png"
 
 # 可选：优先复用已有标签页（减少有窗口模式下切到前台）
 python scripts/publish_pipeline.py --reuse-existing-tab \
@@ -111,13 +111,13 @@ python scripts/publish_pipeline.py --reuse-existing-tab \
 python scripts/publish_pipeline.py --host 10.0.0.12 --port 9222 \
     --title "文章标题" \
     --content "文章正文" \
-    --image-urls "https://example.com/image.jpg"
+    --image-urls "https://upload.wikimedia.org/wikipedia/commons/7/70/Example.png"
 
 # 从文件读取内容
 python scripts/publish_pipeline.py --headless \
     --title-file title.txt \
     --content-file content.txt \
-    --image-urls "https://example.com/image.jpg"
+    --image-urls "https://upload.wikimedia.org/wikipedia/commons/7/70/Example.png"
 
 # 正文最后一行可放话题标签（最多 10 个）
 # 例如 content.txt 最后一行：
