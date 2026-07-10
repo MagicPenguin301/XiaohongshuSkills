@@ -574,12 +574,29 @@ class XiaohongshuPublisher:
         print(f"[cdp_publish] Connecting to {ws_url}")
         self.ws = ws_client.connect(ws_url)
         print("[cdp_publish] Connected to Chrome tab.")
+        self._set_large_viewport()
 
     def disconnect(self):
         """Close the WebSocket connection."""
         if self.ws:
             self.ws.close()
             self.ws = None
+
+    def _set_large_viewport(self):
+        """Keep creator-center responsive layout from hiding the publish footer."""
+        try:
+            self._send(
+                "Emulation.setDeviceMetricsOverride",
+                {
+                    "width": 1440,
+                    "height": 1200,
+                    "deviceScaleFactor": 1,
+                    "mobile": False,
+                },
+                timeout_seconds=5,
+            )
+        except Exception as exc:
+            print(f"[cdp_publish] Warning: failed to set large viewport: {exc}")
 
     # ------------------------------------------------------------------
     # CDP command helpers
@@ -3419,6 +3436,17 @@ class XiaohongshuPublisher:
                     return toRect(button);
                 }}
 
+                const customPublish = document.querySelector("xhs-publish-btn");
+                if (visible(customPublish)) {{
+                    const rect = customPublish.getBoundingClientRect();
+                    return {{
+                        x: rect.x + rect.width / 2,
+                        y: rect.y,
+                        width: rect.width / 2,
+                        height: rect.height,
+                    }};
+                }}
+
                 const keywords = [
                     {json.dumps(SELECTORS["publish_button_text"])},
                     {json.dumps(SELECTORS["schedule_publish_button_text"])},
@@ -3439,11 +3467,13 @@ class XiaohongshuPublisher:
 
     def _is_publish_button_ready(self) -> bool:
         """Return True when the publish button is present, visible and not disabled."""
+        self._scroll_publish_footer_into_view()
         ready = self._evaluate(f"""
             (() => {{
                 const selectors = [
                     {json.dumps(SELECTORS["publish_button"])},
                     "button.publishBtn",
+                    "xhs-publish-btn",
                 ];
                 const visible = (node) => (
                     node instanceof HTMLElement &&
@@ -3455,6 +3485,15 @@ class XiaohongshuPublisher:
                     const button = document.querySelector(selector);
                     if (!visible(button)) {{
                         continue;
+                    }}
+                    if (button.tagName.toLowerCase() === "xhs-publish-btn") {{
+                        if (button.getAttribute("submit-disabled") === "true") {{
+                            continue;
+                        }}
+                        if (button.getAttribute("submit-loading") === "true") {{
+                            continue;
+                        }}
+                        return true;
                     }}
                     if (button.hasAttribute("disabled")) {{
                         continue;
@@ -3469,6 +3508,30 @@ class XiaohongshuPublisher:
             }})()
         """)
         return bool(ready)
+
+    def _scroll_publish_footer_into_view(self):
+        """Scroll the creator-center inner container so the publish footer is mounted."""
+        self._evaluate("""
+            (() => {
+                const selectors = [
+                    '.publish-page-content',
+                    '.publish-page',
+                    '.publish-container',
+                    '.microapp-container',
+                    'main',
+                ];
+                for (const selector of selectors) {
+                    const node = document.querySelector(selector);
+                    if (node && node.scrollHeight > node.clientHeight) {
+                        node.scrollTop = node.scrollHeight;
+                    }
+                }
+                const footer = document.querySelector('.publish-page-publish-btn, .publishBtn, button.publishBtn, xhs-publish-btn');
+                if (footer && footer.scrollIntoView) {
+                    footer.scrollIntoView({block: 'center', inline: 'nearest'});
+                }
+            })()
+        """)
 
     def _wait_for_publish_button_ready(self, timeout_seconds: float = VIDEO_PROCESS_TIMEOUT):
         """Wait until the publish button becomes interactive."""
@@ -3931,6 +3994,12 @@ class XiaohongshuPublisher:
 
     def _click_mouse(self, x: float, y: float):
         """Perform a real left-click via CDP at the given coordinates."""
+        self._send("Input.dispatchMouseEvent", {
+            "type": "mouseMoved",
+            "x": float(x),
+            "y": float(y),
+        })
+        time.sleep(0.05)
         for event_type in ("mousePressed", "mouseReleased"):
             self._send("Input.dispatchMouseEvent", {
                 "type": event_type,
@@ -3940,6 +4009,182 @@ class XiaohongshuPublisher:
                 "clickCount": 1,
             })
             time.sleep(0.05)
+
+    def _dismiss_publish_overlays(self):
+        """Close transient editor/topic overlays before clicking publish."""
+        try:
+            self._send("Page.bringToFront")
+        except CDPError:
+            pass
+        for event_type in ("keyDown", "keyUp"):
+            self._send("Input.dispatchKeyEvent", {
+                "type": event_type,
+                "key": "Escape",
+                "code": "Escape",
+                "windowsVirtualKeyCode": 27,
+                "nativeVirtualKeyCode": 27,
+            })
+        self._evaluate("""
+            (() => {
+                if (document.activeElement && document.activeElement.blur) {
+                    document.activeElement.blur();
+                }
+            })()
+        """)
+        self._sleep(0.4, minimum_seconds=0.2)
+
+    def _click_publish_confirmation_if_present(self) -> bool:
+        """Click a secondary confirmation dialog if Xiaohongshu shows one."""
+        rect = self._evaluate("""
+            (() => {
+                const visible = (node) => (
+                    node instanceof HTMLElement &&
+                    node.offsetParent !== null &&
+                    node.getBoundingClientRect().width > 0 &&
+                    node.getBoundingClientRect().height > 0
+                );
+                const dialogSelectors = [
+                    '[role="dialog"]',
+                    '.d-modal',
+                    '.d-dialog',
+                    '[class*="modal"]',
+                    '[class*="dialog"]'
+                ];
+                const confirmTexts = [
+                    '确认发布',
+                    '继续发布',
+                    '仍要发布',
+                    '确定发布',
+                    '确认',
+                    '确定',
+                    '发布'
+                ];
+                const cancelTexts = ['取消', '暂不', '返回', '关闭'];
+                const containers = [];
+                for (const selector of dialogSelectors) {
+                    for (const node of document.querySelectorAll(selector)) {
+                        if (visible(node)) containers.push(node);
+                    }
+                }
+                for (const root of containers) {
+                    const nodes = root.querySelectorAll('button, [role="button"], .d-button');
+                    for (const node of nodes) {
+                        if (!visible(node)) continue;
+                        const text = (node.innerText || node.textContent || '').trim();
+                        if (!text || cancelTexts.some((item) => text.includes(item))) continue;
+                        if (confirmTexts.some((item) => text === item || text.includes(item))) {
+                            const rect = node.getBoundingClientRect();
+                            return { x: rect.x, y: rect.y, width: rect.width, height: rect.height, text };
+                        }
+                    }
+                }
+                return null;
+            })()
+        """)
+        if not rect:
+            return False
+        cx = rect["x"] + rect["width"] / 2
+        cy = rect["y"] + rect["height"] / 2
+        text = rect.get("text") or "confirmation"
+        print(f"[cdp_publish] Clicking publish confirmation '{text}' at ({cx:.0f}, {cy:.0f})...")
+        self._click_mouse(cx, cy)
+        return True
+
+    def _publish_status_snapshot(self) -> dict[str, Any]:
+        """Return page signals useful for deciding whether publish actually happened."""
+        snapshot = self._evaluate("""
+            (() => {
+                const visible = (node) => (
+                    node instanceof HTMLElement &&
+                    node.offsetParent !== null &&
+                    node.getBoundingClientRect().width > 0 &&
+                    node.getBoundingClientRect().height > 0
+                );
+                const textOf = (node) => ((node && (node.innerText || node.textContent)) || '').trim();
+                const firstText = (selectors) => {
+                    for (const selector of selectors) {
+                        for (const node of document.querySelectorAll(selector)) {
+                            if (!visible(node)) continue;
+                            const text = textOf(node);
+                            if (text) return text.slice(0, 500);
+                        }
+                    }
+                    return '';
+                };
+                const links = document.querySelectorAll('a[href*="xiaohongshu.com/explore"], a[href*="/explore/"]');
+                let noteLink = null;
+                if (links.length > 0) {
+                    noteLink = links[0].href;
+                }
+                if (!noteLink) {
+                    const noteId = document.body.textContent.match(/\\b[0-9a-fA-F]{24}\\b/);
+                    if (noteId) {
+                        noteLink = 'https://www.xiaohongshu.com/explore/' + noteId[0];
+                    }
+                }
+                const feedbackText = firstText([
+                    '[class*="toast"]',
+                    '[class*="message"]',
+                    '[class*="notice"]',
+                    '[class*="notification"]',
+                    '[role="alert"]',
+                    '[role="dialog"]',
+                    '.d-modal',
+                    '.d-dialog'
+                ]);
+                const publishButton = document.querySelector('.publish-page-publish-btn button.bg-red, button.publishBtn, xhs-publish-btn');
+                const publishButtonVisible = visible(publishButton);
+                return {
+                    url: window.location.href,
+                    title: document.title,
+                    note_link: noteLink,
+                    feedback_text: feedbackText,
+                    publish_button_visible: publishButtonVisible,
+                    body_preview: textOf(document.body).slice(0, 500)
+                };
+            })()
+        """)
+        return snapshot if isinstance(snapshot, dict) else {}
+
+    def _wait_for_publish_completion(self, timeout_seconds: float = 45.0) -> str | None:
+        """Wait until the page shows a real publish success signal."""
+        deadline = time.time() + max(5.0, float(timeout_seconds))
+        last_snapshot: dict[str, Any] = {}
+        success_keywords = ("发布成功", "发布完成", "已发布", "审核中", "提交成功")
+        error_keywords = ("发布失败", "提交失败", "请完善", "请检查", "违规", "异常", "稍后再试")
+
+        while time.time() < deadline:
+            if self._click_publish_confirmation_if_present():
+                self._sleep(1.5, minimum_seconds=0.8)
+
+            snapshot = self._publish_status_snapshot()
+            last_snapshot = snapshot
+            note_link = snapshot.get("note_link")
+            if isinstance(note_link, str) and note_link.strip():
+                return note_link.strip()
+
+            url = str(snapshot.get("url") or "")
+            feedback = str(snapshot.get("feedback_text") or "")
+            if "/explore/" in url:
+                return url
+            if any(keyword in feedback for keyword in success_keywords):
+                return None
+            if any(keyword in feedback for keyword in error_keywords):
+                raise CDPError(f"Publish failed after click: {feedback[:240]}")
+            if "/publish" not in url and "creator.xiaohongshu.com" in url:
+                return None
+
+            self._sleep(1.5, minimum_seconds=0.8)
+
+        url = str(last_snapshot.get("url") or "")
+        feedback = str(last_snapshot.get("feedback_text") or "")
+        publish_button_visible = last_snapshot.get("publish_button_visible")
+        body_preview = str(last_snapshot.get("body_preview") or "")
+        raise CDPError(
+            "Publish click did not produce a success confirmation. "
+            f"url={url!r}, publish_button_visible={publish_button_visible}, "
+            f"feedback={feedback[:240]!r}, body={body_preview[:240]!r}"
+        )
 
     def _click_element_by_cdp(self, description: str, js_get_rect: str):
         """Click an element using CDP Input.dispatchMouseEvent for reliable clicks.
@@ -3978,6 +4223,7 @@ class XiaohongshuPublisher:
     def _click_publish(self, scheduled: bool = False):
         """Click the publish button using CDP mouse events."""
         print("[cdp_publish] Clicking publish button...")
+        self._dismiss_publish_overlays()
         self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
         self._wait_for_publish_button_ready(timeout_seconds=20.0)
         rect = self._get_publish_button_rect()
@@ -3993,25 +4239,7 @@ class XiaohongshuPublisher:
         self._click_mouse(cx, cy)
         print("[cdp_publish] Publish button clicked.")
 
-        # Wait for publish success and get note link
-        self._sleep(5, minimum_seconds=2.0)
-        note_link = self._evaluate("""
-            (function() {
-                // Try to find note link in success message
-                var links = document.querySelectorAll('a[href*="xiaohongshu.com/explore"]');
-                if (links.length > 0) {
-                    return links[0].href;
-                }
-                // Try to find note ID in page
-                var noteId = document.body.textContent.match(/\\b[0-9a-fA-F]{24}\\b/);
-                if (noteId) {
-                    return 'https://www.xiaohongshu.com/explore/' + noteId[0];
-                }
-                return null;
-            })();
-        """)
-
-        return note_link
+        return self._wait_for_publish_completion(timeout_seconds=45.0)
 
     # ------------------------------------------------------------------
     # Main publish workflow

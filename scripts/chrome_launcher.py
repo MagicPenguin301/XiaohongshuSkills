@@ -15,6 +15,7 @@ import sys
 import time
 import socket
 import subprocess
+import tempfile
 from typing import Optional
 
 CDP_PORT = 9222
@@ -108,6 +109,30 @@ def is_port_open(port: int, host: str = "127.0.0.1") -> bool:
             return False
 
 
+def describe_profile_singleton_lock(user_data_dir: str) -> str | None:
+    """Return a human-readable profile lock diagnostic, if Chromium left one."""
+    lock_path = os.path.join(user_data_dir, "SingletonLock")
+    socket_path = os.path.join(user_data_dir, "SingletonSocket")
+    cookie_path = os.path.join(user_data_dir, "SingletonCookie")
+    if not any(os.path.lexists(path) for path in (lock_path, socket_path, cookie_path)):
+        return None
+    lock_target = ""
+    if os.path.lexists(lock_path):
+        try:
+            lock_target = os.readlink(lock_path)
+        except OSError:
+            lock_target = "<not a symlink>"
+    lines = [
+        "[chrome_launcher] Profile lock detected. Chromium may already be using this profile,",
+        "or a previous Chromium process may have left stale Singleton* files.",
+    ]
+    if lock_target:
+        lines.append(f"  SingletonLock: {lock_target}")
+    lines.append(f"  profile dir: {user_data_dir}")
+    lines.append("  If no Chromium process is using this profile, close Chromium and remove Singleton* files.")
+    return "\n".join(lines)
+
+
 def launch_chrome(
     port: int = CDP_PORT,
     headless: bool = False,
@@ -148,6 +173,7 @@ def launch_chrome(
 
     if headless:
         cmd.append("--headless=new")
+        cmd.append("--window-size=1440,1200")
 
     mode_label = "headless" if headless else "headed"
     account_label = account or "default"
@@ -156,10 +182,18 @@ def launch_chrome(
     print(f"  profile dir: {user_data_dir}")
     print(f"  debug port : {port}")
 
+    log_dir = os.path.join(tempfile.gettempdir(), "xhs-chrome-launcher")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, f"chrome-{port}.log")
+    log_file = open(log_path, "a", encoding="utf-8")
+    log_file.write("\n--- Chrome launch ---\n")
+    log_file.write(" ".join(cmd) + "\n")
+    log_file.flush()
+
     proc = subprocess.Popen(
         cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_file,
+        stderr=log_file,
     )
     _chrome_process = proc
 
@@ -168,14 +202,31 @@ def launch_chrome(
     while time.time() < deadline:
         if is_port_open(port):
             print(f"[chrome_launcher] Chrome is ready on port {port}.")
+            log_file.close()
+            return proc
+        if proc.poll() is not None:
+            print(
+                f"[chrome_launcher] Chrome process exited early with code {proc.returncode}. "
+                f"See log: {log_path}",
+                file=sys.stderr,
+            )
+            lock_note = describe_profile_singleton_lock(user_data_dir)
+            if lock_note:
+                print(lock_note, file=sys.stderr)
+            log_file.close()
             return proc
         time.sleep(0.5)
 
     print(
         f"[chrome_launcher] WARNING: Chrome started but port {port} not responding "
-        f"after {STARTUP_TIMEOUT}s. It may still be initializing.",
+        f"after {STARTUP_TIMEOUT}s. It may still be initializing. "
+        f"See log: {log_path}",
         file=sys.stderr,
     )
+    lock_note = describe_profile_singleton_lock(user_data_dir)
+    if lock_note:
+        print(lock_note, file=sys.stderr)
+    log_file.close()
     return proc
 
 
