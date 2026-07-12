@@ -137,6 +137,7 @@ def launch_chrome(
     port: int = CDP_PORT,
     headless: bool = False,
     account: Optional[str] = None,
+    proxy_server: Optional[str] = None,
 ) -> subprocess.Popen | None:
     """
     Launch Chrome with remote debugging enabled.
@@ -145,6 +146,7 @@ def launch_chrome(
         port: CDP remote debugging port.
         headless: If True, launch Chrome in headless mode (no GUI window).
         account: Account name to use. If None, uses the default account.
+        proxy_server: Optional Chrome proxy server, e.g. http://127.0.0.1:7890.
 
     Returns the Popen object if a new process was started, or None if Chrome
     was already running on the target port.
@@ -174,6 +176,8 @@ def launch_chrome(
     if headless:
         cmd.append("--headless=new")
         cmd.append("--window-size=1440,1200")
+    if proxy_server:
+        cmd.append(f"--proxy-server={proxy_server}")
 
     mode_label = "headless" if headless else "headed"
     account_label = account or "default"
@@ -181,6 +185,8 @@ def launch_chrome(
     print(f"  executable : {chrome_path}")
     print(f"  profile dir: {user_data_dir}")
     print(f"  debug port : {port}")
+    if proxy_server:
+        print(f"  proxy      : {proxy_server}")
 
     log_dir = os.path.join(tempfile.gettempdir(), "xhs-chrome-launcher")
     os.makedirs(log_dir, exist_ok=True)
@@ -311,6 +317,7 @@ def restart_chrome(
     port: int = CDP_PORT,
     headless: bool = False,
     account: Optional[str] = None,
+    proxy_server: Optional[str] = None,
 ) -> subprocess.Popen | None:
     """
     Kill the current Chrome instance and relaunch with the specified mode.
@@ -322,6 +329,7 @@ def restart_chrome(
         port: CDP remote debugging port.
         headless: If True, relaunch in headless mode.
         account: Account name to use. If None, uses the default account.
+        proxy_server: Optional Chrome proxy server, e.g. http://127.0.0.1:7890.
 
     Returns the Popen object for the new Chrome process.
     """
@@ -330,13 +338,19 @@ def restart_chrome(
     print(f"[chrome_launcher] Restarting Chrome ({mode_label}, account: {account_label})...")
     kill_chrome(port)
     time.sleep(1)
-    return launch_chrome(port, headless=headless, account=account)
+    return launch_chrome(
+        port,
+        headless=headless,
+        account=account,
+        proxy_server=proxy_server,
+    )
 
 
 def ensure_chrome(
     port: int = CDP_PORT,
     headless: bool = False,
     account: Optional[str] = None,
+    proxy_server: Optional[str] = None,
 ) -> bool:
     """
     Ensure Chrome is running with remote debugging on the given port.
@@ -346,13 +360,19 @@ def ensure_chrome(
         headless: If True, launch in headless mode when starting a new instance.
             If Chrome is already running, this parameter is ignored.
         account: Account name to use. If None, uses the default account.
+        proxy_server: Optional Chrome proxy server, e.g. http://127.0.0.1:7890.
 
     Returns True if Chrome is available, False otherwise.
     """
     if is_port_open(port):
         return True
     try:
-        launch_chrome(port, headless=headless, account=account)
+        launch_chrome(
+            port,
+            headless=headless,
+            account=account,
+            proxy_server=proxy_server,
+        )
         return is_port_open(port)
     except FileNotFoundError as e:
         print(f"[chrome_launcher] Error: {e}", file=sys.stderr)
@@ -373,15 +393,26 @@ if __name__ == "__main__":
     parser.add_argument("--kill", action="store_true", help="Kill the running Chrome instance")
     parser.add_argument("--restart", action="store_true", help="Restart Chrome")
     parser.add_argument("--account", help="Account name to use (default: default account)")
+    parser.add_argument("--proxy-server", help="Chrome proxy server, e.g. http://127.0.0.1:7890")
     args = parser.parse_args()
 
     if args.kill:
         kill_chrome(port=args.port)
         print("[chrome_launcher] Chrome killed.")
     elif args.restart:
-        restart_chrome(port=args.port, headless=args.headless, account=args.account)
+        restart_chrome(
+            port=args.port,
+            headless=args.headless,
+            account=args.account,
+            proxy_server=args.proxy_server,
+        )
         print("[chrome_launcher] Chrome restarted.")
-    elif ensure_chrome(port=args.port, headless=args.headless, account=args.account):
+    elif ensure_chrome(
+        port=args.port,
+        headless=args.headless,
+        account=args.account,
+        proxy_server=args.proxy_server,
+    ):
         print("[chrome_launcher] Chrome is ready for CDP connections.")
     else:
         print("[chrome_launcher] Failed to start Chrome.", file=sys.stderr)

@@ -514,6 +514,79 @@ class XiaohongshuPublisher:
                 else:
                     raise CDPError(f"Cannot reach Chrome on {self.host}:{self.port}: {e}")
 
+    def _evaluate_target_value(
+        self,
+        ws_url: str,
+        expression: str,
+        timeout: float = 2.0,
+    ) -> Any:
+        """Evaluate JavaScript on a target before choosing which tab to attach to."""
+        ws = ws_client.connect(ws_url)
+        try:
+            ws.send(json.dumps({
+                "id": 1,
+                "method": "Runtime.evaluate",
+                "params": {
+                    "expression": expression,
+                    "returnByValue": True,
+                    "awaitPromise": True,
+                },
+            }))
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                raw = ws.recv(timeout=max(0.1, deadline - time.time()))
+                msg = json.loads(raw)
+                if msg.get("id") != 1:
+                    continue
+                result = msg.get("result", {}).get("result", {})
+                return result.get("value")
+        finally:
+            ws.close()
+        return None
+
+    def _publish_target_score(self, target: dict) -> int:
+        """Score existing publish tabs; higher means more likely ready for click-publish."""
+        ws_url = target.get("webSocketDebuggerUrl")
+        if not ws_url:
+            return 0
+        try:
+            value = self._evaluate_target_value(ws_url, """
+                (() => {
+                    const visible = (node) => {
+                        if (!(node instanceof HTMLElement)) return false;
+                        const rect = node.getBoundingClientRect();
+                        const style = getComputedStyle(node);
+                        return (
+                            rect.width > 0 &&
+                            rect.height > 0 &&
+                            style.display !== "none" &&
+                            style.visibility !== "hidden" &&
+                            Number(style.opacity || 1) !== 0
+                        );
+                    };
+                    const body = String(document.body && document.body.innerText || "");
+                    const publishButton = document.querySelector("xhs-publish-btn");
+                    let score = 0;
+                    if (publishButton && visible(publishButton)) {
+                        score += 200;
+                        if (publishButton.getAttribute("submit-disabled") !== "true") score += 500;
+                        if (publishButton.getAttribute("submit-loading") !== "true") score += 100;
+                    }
+                    if (document.querySelector(".publish-page-publish-btn button.bg-red, button.publishBtn")) {
+                        score += 200;
+                    }
+                    if (body.includes("笔记预览")) score += 80;
+                    if (/\\d+\\/\\d+/.test(body)) score += 50;
+                    if (body.length > 300) score += 30;
+                    return score;
+                })()
+            """)
+            if isinstance(value, (int, float)):
+                return int(value)
+        except Exception:
+            return 0
+        return 0
+
     def _find_or_create_tab(
         self,
         target_url_prefix: str = "",
@@ -533,17 +606,30 @@ class XiaohongshuPublisher:
         ]
 
         if target_url_prefix:
-            for t in pages:
-                if t.get("url", "").startswith(target_url_prefix):
-                    return t["webSocketDebuggerUrl"]
+            matching_pages = [
+                t for t in pages
+                if t.get("url", "").startswith(target_url_prefix)
+            ]
+            if matching_pages:
+                best = max(matching_pages, key=self._publish_target_score)
+                print(
+                    "[cdp_publish] Reusing matching tab: "
+                    f"{best.get('url', '')}"
+                )
+                return best["webSocketDebuggerUrl"]
 
         if reuse_existing_tab and pages:
-            url = pages[0].get("url", "")
+            publish_pages = [
+                t for t in pages
+                if t.get("url", "").startswith("https://creator.xiaohongshu.com/publish")
+            ]
+            page = max(publish_pages, key=self._publish_target_score) if publish_pages else pages[0]
+            url = page.get("url", "")
             print(
                 "[cdp_publish] Reusing existing tab to reduce focus switching: "
                 f"{url}"
             )
-            return pages[0]["webSocketDebuggerUrl"]
+            return page["webSocketDebuggerUrl"]
 
         # Create a new tab
         resp = requests.put(
@@ -3422,9 +3508,11 @@ class XiaohongshuPublisher:
                 const buttonSelector = {json.dumps(SELECTORS["publish_button"])};
                 const visible = (node) => (
                     node instanceof HTMLElement &&
-                    node.offsetParent !== null &&
                     node.getBoundingClientRect().width > 0 &&
-                    node.getBoundingClientRect().height > 0
+                    node.getBoundingClientRect().height > 0 &&
+                    getComputedStyle(node).display !== "none" &&
+                    getComputedStyle(node).visibility !== "hidden" &&
+                    Number(getComputedStyle(node).opacity || 1) !== 0
                 );
                 const toRect = (node) => {{
                     const rect = node.getBoundingClientRect();
@@ -3438,6 +3526,12 @@ class XiaohongshuPublisher:
 
                 const customPublish = document.querySelector("xhs-publish-btn");
                 if (visible(customPublish)) {{
+                    const shadowButton = customPublish._sr && customPublish._sr.querySelector
+                        ? customPublish._sr.querySelector(".ce-btn.bg-red, button.bg-red")
+                        : null;
+                    if (visible(shadowButton)) {{
+                        return toRect(shadowButton);
+                    }}
                     const rect = customPublish.getBoundingClientRect();
                     return {{
                         x: rect.x + rect.width / 2,
@@ -3477,9 +3571,11 @@ class XiaohongshuPublisher:
                 ];
                 const visible = (node) => (
                     node instanceof HTMLElement &&
-                    node.offsetParent !== null &&
                     node.getBoundingClientRect().width > 0 &&
-                    node.getBoundingClientRect().height > 0
+                    node.getBoundingClientRect().height > 0 &&
+                    getComputedStyle(node).display !== "none" &&
+                    getComputedStyle(node).visibility !== "hidden" &&
+                    Number(getComputedStyle(node).opacity || 1) !== 0
                 );
                 for (const selector of selectors) {{
                     const button = document.querySelector(selector);
@@ -3491,6 +3587,12 @@ class XiaohongshuPublisher:
                             continue;
                         }}
                         if (button.getAttribute("submit-loading") === "true") {{
+                            continue;
+                        }}
+                        const shadowButton = button._sr && button._sr.querySelector
+                            ? button._sr.querySelector(".ce-btn.bg-red, button.bg-red")
+                            : null;
+                        if (shadowButton && !visible(shadowButton)) {{
                             continue;
                         }}
                         return true;
@@ -3508,6 +3610,88 @@ class XiaohongshuPublisher:
             }})()
         """)
         return bool(ready)
+
+    def _publish_button_diagnostics(self) -> str:
+        """Return compact DOM diagnostics for publish-button lookup failures."""
+        data = self._evaluate("""
+            (() => {
+                const visible = (node) => {
+                    if (!(node instanceof HTMLElement)) return false;
+                    const rect = node.getBoundingClientRect();
+                    const style = getComputedStyle(node);
+                    return (
+                        rect.width > 0 &&
+                        rect.height > 0 &&
+                        style.display !== "none" &&
+                        style.visibility !== "hidden" &&
+                        Number(style.opacity || 1) !== 0
+                    );
+                };
+                const describe = (node) => {
+                    const rect = node.getBoundingClientRect();
+                    return {
+                        tag: node.tagName,
+                        id: node.id || "",
+                        className: String(node.className || "").slice(0, 120),
+                        text: String(node.innerText || node.textContent || "")
+                            .replace(/\\s+/g, " ")
+                            .trim()
+                            .slice(0, 120),
+                        attrs: Object.fromEntries(
+                            Array.from(node.attributes || [])
+                                .map((attr) => [attr.name, attr.value])
+                                .slice(0, 12)
+                        ),
+                        rect: {
+                            x: Math.round(rect.x),
+                            y: Math.round(rect.y),
+                            w: Math.round(rect.width),
+                            h: Math.round(rect.height)
+                        },
+                        visible: visible(node)
+                    };
+                };
+                const selectors = [
+                    ".publish-page-publish-btn button.bg-red",
+                    "button.publishBtn",
+                    "xhs-publish-btn",
+                    "button",
+                    "[role='button']",
+                    ".d-button"
+                ];
+                const nodes = [];
+                for (const selector of selectors) {
+                    for (const node of document.querySelectorAll(selector)) {
+                        if (!nodes.includes(node)) nodes.push(node);
+                    }
+                }
+                const candidates = nodes
+                    .map(describe)
+                    .filter((item) => {
+                        const haystack = JSON.stringify(item);
+                        return /发布|publish|submit/i.test(haystack);
+                    })
+                    .slice(0, 12);
+                return {
+                    url: location.href,
+                    title: document.title,
+                    viewport: {
+                        w: innerWidth,
+                        h: innerHeight,
+                        scrollX,
+                        scrollY
+                    },
+                    xhsPublishButtonCount: document.querySelectorAll("xhs-publish-btn").length,
+                    candidates,
+                    bodyTail: String(document.body && document.body.innerText || "")
+                        .slice(-500)
+                };
+            })()
+        """)
+        try:
+            return json.dumps(data, ensure_ascii=False)[:2000]
+        except TypeError:
+            return str(data)[:2000]
 
     def _scroll_publish_footer_into_view(self):
         """Scroll the creator-center inner container so the publish footer is mounted."""
@@ -3543,7 +3727,8 @@ class XiaohongshuPublisher:
             self._sleep(VIDEO_PROCESS_POLL, minimum_seconds=0.4)
 
         raise CDPError(
-            f"Publish button did not become ready within {int(timeout_seconds)}s."
+            f"Publish button did not become ready within {int(timeout_seconds)}s. "
+            f"Diagnostics: {self._publish_button_diagnostics()}"
         )
 
     def _click_tab(self, tab_selector: str, tab_text: str):
@@ -3998,16 +4183,21 @@ class XiaohongshuPublisher:
             "type": "mouseMoved",
             "x": float(x),
             "y": float(y),
+            "button": "none",
+            "buttons": 0,
         })
         time.sleep(0.05)
-        for event_type in ("mousePressed", "mouseReleased"):
-            self._send("Input.dispatchMouseEvent", {
+        for event_type, buttons in (("mousePressed", 1), ("mouseReleased", 0)):
+            params = {
                 "type": event_type,
                 "x": float(x),
                 "y": float(y),
                 "button": "left",
+                "buttons": buttons,
                 "clickCount": 1,
-            })
+                "pointerType": "mouse",
+            }
+            self._send("Input.dispatchMouseEvent", params)
             time.sleep(0.05)
 
     def _dismiss_publish_overlays(self):
@@ -4090,6 +4280,80 @@ class XiaohongshuPublisher:
         self._click_mouse(cx, cy)
         return True
 
+    def _click_publish_button_dom_fallback(self) -> bool:
+        """Fallback for creator-center custom elements that ignore CDP mouse events."""
+        clicked = self._evaluate("""
+            (() => {
+                const visible = (node) => {
+                    if (!(node instanceof HTMLElement)) return false;
+                    const rect = node.getBoundingClientRect();
+                    const style = getComputedStyle(node);
+                    return (
+                        rect.width > 0 &&
+                        rect.height > 0 &&
+                        style.display !== "none" &&
+                        style.visibility !== "hidden" &&
+                        Number(style.opacity || 1) !== 0
+                    );
+                };
+                const selectors = [
+                    ".publish-page-publish-btn button.bg-red",
+                    "button.publishBtn",
+                    "xhs-publish-btn"
+                ];
+                let target = null;
+                for (const selector of selectors) {
+                    const node = document.querySelector(selector);
+                    if (visible(node)) {
+                        target = node;
+                        break;
+                    }
+                }
+                if (!target) return false;
+
+                if (
+                    target.tagName &&
+                    target.tagName.toLowerCase() === "xhs-publish-btn" &&
+                    typeof target._onPublish === "function"
+                ) {
+                    target._onPublish();
+                    return true;
+                }
+
+                const rect = target.getBoundingClientRect();
+                const eventInit = {
+                    bubbles: true,
+                    cancelable: true,
+                    composed: true,
+                    view: window,
+                    clientX: rect.left + rect.width * 0.75,
+                    clientY: rect.top + rect.height / 2,
+                    button: 0,
+                    buttons: 1,
+                    pointerType: "mouse"
+                };
+                target.focus && target.focus();
+                target.dispatchEvent(new PointerEvent("pointerover", eventInit));
+                target.dispatchEvent(new PointerEvent("pointerenter", eventInit));
+                target.dispatchEvent(new PointerEvent("pointerdown", eventInit));
+                target.dispatchEvent(new MouseEvent("mouseover", eventInit));
+                target.dispatchEvent(new MouseEvent("mouseenter", eventInit));
+                target.dispatchEvent(new MouseEvent("mousedown", eventInit));
+
+                const releaseInit = { ...eventInit, buttons: 0 };
+                target.dispatchEvent(new PointerEvent("pointerup", releaseInit));
+                target.dispatchEvent(new MouseEvent("mouseup", releaseInit));
+                target.dispatchEvent(new MouseEvent("click", releaseInit));
+                if (typeof target.click === "function") {
+                    target.click();
+                }
+                return true;
+            })()
+        """)
+        if clicked:
+            print("[cdp_publish] DOM fallback click dispatched on publish button.")
+        return bool(clicked)
+
     def _publish_status_snapshot(self) -> dict[str, Any]:
         """Return page signals useful for deciding whether publish actually happened."""
         snapshot = self._evaluate("""
@@ -4146,7 +4410,7 @@ class XiaohongshuPublisher:
         """)
         return snapshot if isinstance(snapshot, dict) else {}
 
-    def _wait_for_publish_completion(self, timeout_seconds: float = 45.0) -> str | None:
+    def _wait_for_publish_completion(self, timeout_seconds: float = 120.0) -> str | None:
         """Wait until the page shows a real publish success signal."""
         deadline = time.time() + max(5.0, float(timeout_seconds))
         last_snapshot: dict[str, Any] = {}
@@ -4167,6 +4431,10 @@ class XiaohongshuPublisher:
             feedback = str(snapshot.get("feedback_text") or "")
             if "/explore/" in url:
                 return url
+            if parse_qs(urlparse(url).query).get("published") == ["true"]:
+                return None
+            if "/new/note-manager" in url:
+                return None
             if any(keyword in feedback for keyword in success_keywords):
                 return None
             if any(keyword in feedback for keyword in error_keywords):
@@ -4230,7 +4498,8 @@ class XiaohongshuPublisher:
         if not rect:
             raise CDPError(
                 "Could not find publish button. "
-                "The creator center page structure may have changed."
+                "The creator center page structure may have changed. "
+                f"Diagnostics: {self._publish_button_diagnostics()}"
             )
 
         cx = rect["x"] + rect["width"] / 2
@@ -4238,8 +4507,18 @@ class XiaohongshuPublisher:
         print(f"[cdp_publish] Clicking publish button at ({cx:.0f}, {cy:.0f})...")
         self._click_mouse(cx, cy)
         print("[cdp_publish] Publish button clicked.")
+        self._sleep(1.5, minimum_seconds=0.8)
 
-        return self._wait_for_publish_completion(timeout_seconds=45.0)
+        snapshot = self._publish_status_snapshot()
+        url = str(snapshot.get("url") or "")
+        if (
+            "/publish" in url
+            and snapshot.get("publish_button_visible")
+        ):
+            print("[cdp_publish] Publish page did not react to CDP click; trying DOM fallback...")
+            self._click_publish_button_dom_fallback()
+
+        return self._wait_for_publish_completion(timeout_seconds=120.0)
 
     # ------------------------------------------------------------------
     # Main publish workflow

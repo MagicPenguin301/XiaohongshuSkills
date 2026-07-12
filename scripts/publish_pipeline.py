@@ -386,6 +386,14 @@ def main():
             "Useful in headed mode to reduce foreground focus switching."
         ),
     )
+    parser.add_argument(
+        "--proxy-server",
+        default=None,
+        help=(
+            "Chrome proxy server for local browser launch, "
+            "e.g. http://127.0.0.1:7890. Ignored in remote CDP mode."
+        ),
+    )
 
     # Optional temp dir for downloaded images
     parser.add_argument(
@@ -440,6 +448,7 @@ def main():
     account = args.account
     cache_account_name = _resolve_account_name(account)
     reuse_existing_tab = args.reuse_existing_tab
+    proxy_server = args.proxy_server
     timing_jitter = _normalize_timing_jitter(args.timing_jitter)
     local_mode = _is_local_host(host)
     post_time = args.post_time
@@ -489,8 +498,16 @@ def main():
     print(f"[pipeline] Timing jitter ratio: {timing_jitter:.2f}")
     if reuse_existing_tab:
         print("[pipeline] Tab selection mode: prefer reusing existing tab.")
+    if proxy_server:
+        proxy_note = "local Chrome launch" if local_mode else "ignored in remote CDP mode"
+        print(f"[pipeline] Chrome proxy server: {proxy_server} ({proxy_note}).")
     if local_mode:
-        if not ensure_chrome(port=port, headless=headless, account=account):
+        if not ensure_chrome(
+            port=port,
+            headless=headless,
+            account=account,
+            proxy_server=proxy_server,
+        ):
             print("Error: Failed to start Chrome.", file=sys.stderr)
             sys.exit(2)
     else:
@@ -517,7 +534,12 @@ def main():
                 if local_mode:
                     # Auto-fallback: restart Chrome in headed mode for QR login
                     print("[pipeline] Headless mode: not logged in. Switching to headed mode for login...")
-                    restart_chrome(port=port, headless=False, account=account)
+                    restart_chrome(
+                        port=port,
+                        headless=False,
+                        account=account,
+                        proxy_server=proxy_server,
+                    )
                     publisher.connect(reuse_existing_tab=reuse_existing_tab)
                     publisher.open_login_page()
                 else:
