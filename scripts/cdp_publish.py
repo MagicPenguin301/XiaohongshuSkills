@@ -55,7 +55,7 @@ import csv
 import base64
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, unquote, urlencode, urlparse, urlunparse
 from typing import Any
 
 # Add scripts dir to path so sibling modules can be imported in both
@@ -152,14 +152,14 @@ SELECTORS = {
 }
 
 # Timing
-PAGE_LOAD_WAIT = 3  # seconds to wait after navigation
-TAB_CLICK_WAIT = 2  # seconds to wait after clicking tab
-UPLOAD_WAIT = 6  # seconds to wait after image upload for editor to appear
-VIDEO_PROCESS_TIMEOUT = 120  # seconds to wait for video processing
-VIDEO_PROCESS_POLL = 3  # seconds between video processing status checks
-ACTION_INTERVAL = 1  # seconds between actions
+PAGE_LOAD_WAIT = 8  # seconds to wait after navigation
+TAB_CLICK_WAIT = 4  # seconds to wait after clicking tab
+UPLOAD_WAIT = 15  # seconds to wait after image upload for editor to appear
+VIDEO_PROCESS_TIMEOUT = 300  # seconds to wait for video processing
+VIDEO_PROCESS_POLL = 5  # seconds between video processing status checks
+ACTION_INTERVAL = 2  # seconds between actions
 MAX_TIMING_JITTER_RATIO = 0.7
-CDP_COMMAND_TIMEOUT = 15.0
+CDP_COMMAND_TIMEOUT = 45.0
 DEFAULT_LOGIN_CACHE_TTL_HOURS = 12.0
 LOGIN_CACHE_FILE = os.path.abspath(
     os.path.join(SCRIPT_DIR, "..", "tmp", "login_status_cache.json")
@@ -174,6 +174,82 @@ def _normalize_timing_jitter(value: float) -> float:
 def _is_local_host(host: str) -> bool:
     """Return True when host points to the local machine."""
     return host.strip().lower() in {"127.0.0.1", "localhost", "::1"}
+
+
+def _split_proxy_auth(proxy_server: str | None) -> dict[str, str | None]:
+    """Return Chrome-safe proxy server plus optional auth from a proxy URL."""
+    proxy = str(proxy_server or "").strip()
+    if not proxy:
+        return {"server": None, "username": None, "password": None}
+
+    parsed = urlparse(proxy)
+    if not parsed.scheme or not parsed.netloc or parsed.username is None:
+        return {"server": proxy, "username": None, "password": None}
+
+    host = parsed.hostname or ""
+    if not host:
+        return {"server": proxy, "username": None, "password": None}
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
+    server = urlunparse((parsed.scheme, netloc, "", "", "", ""))
+    return {
+        "server": server,
+        "username": unquote(parsed.username),
+        "password": unquote(parsed.password or ""),
+    }
+
+
+def _load_default_proxy_options() -> dict[str, str | None]:
+    """Load default proxy options for standalone cdp_publish.py commands."""
+    repo_root = os.path.abspath(os.path.join(SCRIPT_DIR, "..", "..", ".."))
+    config_path = os.environ.get(
+        "REDNOTE_XHS_CONFIG",
+        os.path.join(repo_root, "configs", "daily.yaml"),
+    )
+
+    config_proxy: dict[str, str | None] = {
+        "server": None,
+        "username": None,
+        "password": None,
+    }
+    if os.path.exists(config_path):
+        try:
+            import yaml
+
+            with open(config_path, "r", encoding="utf-8") as handle:
+                raw = yaml.safe_load(handle) or {}
+            xhs_config = (
+                raw.get("publishing", {})
+                .get("xhs_cli", {})
+                if isinstance(raw, dict)
+                else {}
+            )
+            if isinstance(xhs_config, dict):
+                config_proxy = {
+                    "server": xhs_config.get("proxy_server"),
+                    "username": xhs_config.get("proxy_username"),
+                    "password": xhs_config.get("proxy_password"),
+                }
+        except Exception as exc:
+            print(
+                f"[cdp_publish] Warning: could not load proxy config from {config_path}: {exc}",
+                file=sys.stderr,
+            )
+
+    return {
+        "server": os.environ.get("REDNOTE_XHS_PROXY_SERVER") or config_proxy["server"],
+        "username": (
+            os.environ.get("REDNOTE_XHS_PROXY_USERNAME")
+            if os.environ.get("REDNOTE_XHS_PROXY_USERNAME") is not None
+            else config_proxy["username"]
+        ),
+        "password": (
+            os.environ.get("REDNOTE_XHS_PROXY_PASSWORD")
+            if os.environ.get("REDNOTE_XHS_PROXY_PASSWORD") is not None
+            else config_proxy["password"]
+        ),
+    }
 
 
 def _resolve_account_name(account_name: str | None) -> str:
@@ -327,6 +403,9 @@ class XiaohongshuPublisher:
         timing_jitter: float = 0.25,
         account_name: str | None = None,
         preserve_upload_paths: bool = False,
+        proxy_server: str | None = None,
+        proxy_username: str | None = None,
+        proxy_password: str | None = None,
     ):
         self.host = host
         self.port = port
@@ -335,6 +414,10 @@ class XiaohongshuPublisher:
         self.timing_jitter = _normalize_timing_jitter(timing_jitter)
         self.account_name = (account_name or "default").strip() or "default"
         self.preserve_upload_paths = bool(preserve_upload_paths)
+        self.proxy_server = (proxy_server or "").strip() or None
+        self.proxy_username = (proxy_username or "").strip()
+        self.proxy_password = proxy_password or ""
+        self._proxy_auth_enabled = False
         self.command_timeout_seconds = CDP_COMMAND_TIMEOUT
         self.login_cache_ttl_hours = DEFAULT_LOGIN_CACHE_TTL_HOURS
         self.login_cache_ttl_seconds = self.login_cache_ttl_hours * 3600
@@ -474,14 +557,27 @@ class XiaohongshuPublisher:
     def _sleep(self, base_seconds: float, minimum_seconds: float = 0.05):
         """Sleep with optional randomized jitter to avoid rigid timing patterns."""
         base = max(minimum_seconds, float(base_seconds))
-        if self.timing_jitter <= 0:
+        if self.timing_jitter > 0:
+            delta = base * self.timing_jitter
+            low = max(minimum_seconds, base - delta)
+            high = max(low, base + delta)
+            base = random.uniform(low, high)
+
+        if not self.ws or not self._proxy_auth_enabled:
             time.sleep(base)
             return
 
-        delta = base * self.timing_jitter
-        low = max(minimum_seconds, base - delta)
-        high = max(low, base + delta)
-        time.sleep(random.uniform(low, high))
+        deadline = time.monotonic() + base
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            try:
+                self._recv_cdp_message(timeout=min(0.25, max(0.05, remaining)))
+            except TimeoutError:
+                continue
+            except Exception:
+                return
 
     # ------------------------------------------------------------------
     # CDP connection management
@@ -504,7 +600,7 @@ class XiaohongshuPublisher:
                     if _is_local_host(self.host):
                         print(f"[cdp_publish] CDP connection failed ({e}), restarting Chrome...")
                         from chrome_launcher import ensure_chrome
-                        ensure_chrome(port=self.port)
+                        ensure_chrome(port=self.port, proxy_server=self.proxy_server)
                     else:
                         print(
                             f"[cdp_publish] CDP connection failed ({e}), retrying remote endpoint "
@@ -632,8 +728,9 @@ class XiaohongshuPublisher:
             return page["webSocketDebuggerUrl"]
 
         # Create a new tab
+        initial_url = "about:blank" if self._has_proxy_auth_credentials() else XHS_CREATOR_URL
         resp = requests.put(
-            f"http://{self.host}:{self.port}/json/new?{XHS_CREATOR_URL}",
+            f"http://{self.host}:{self.port}/json/new?{initial_url}",
             timeout=5,
             proxies={"http": None, "https": None} if _is_local_host(self.host) else None,
         )
@@ -660,6 +757,7 @@ class XiaohongshuPublisher:
         print(f"[cdp_publish] Connecting to {ws_url}")
         self.ws = ws_client.connect(ws_url)
         print("[cdp_publish] Connected to Chrome tab.")
+        self._enable_proxy_auth_if_needed()
         self._set_large_viewport()
 
     def disconnect(self):
@@ -687,6 +785,84 @@ class XiaohongshuPublisher:
     # ------------------------------------------------------------------
     # CDP command helpers
     # ------------------------------------------------------------------
+
+    def _has_proxy_auth_credentials(self) -> bool:
+        return bool(self.proxy_username or self.proxy_password)
+
+    def _send_cdp_nowait(self, method: str, params: dict | None = None):
+        """Send a CDP command without waiting for its response."""
+        if not self.ws:
+            return
+        self._msg_id += 1
+        msg = {"id": self._msg_id, "method": method}
+        if params:
+            msg["params"] = params
+        self.ws.send(json.dumps(msg))
+
+    def _enable_proxy_auth_if_needed(self):
+        """Enable Fetch auth handling so proxy authentication can be answered."""
+        if not self._has_proxy_auth_credentials() or self._proxy_auth_enabled:
+            return
+        self._send(
+            "Fetch.enable",
+            {
+                "handleAuthRequests": True,
+                "patterns": [{"urlPattern": "*"}],
+            },
+            timeout_seconds=5,
+        )
+        self._proxy_auth_enabled = True
+        print("[cdp_publish] Proxy authentication handler enabled.")
+
+    def _handle_cdp_event(self, data: dict[str, Any]) -> bool:
+        """Handle CDP events that must be answered to keep requests flowing."""
+        method = data.get("method")
+        params = data.get("params", {})
+        if not isinstance(params, dict):
+            return False
+
+        if method == "Fetch.authRequired":
+            request_id = params.get("requestId")
+            if not isinstance(request_id, str):
+                return True
+            challenge = params.get("authChallenge", {})
+            source = challenge.get("source") if isinstance(challenge, dict) else ""
+            response: dict[str, Any]
+            if self._has_proxy_auth_credentials():
+                response = {
+                    "response": "ProvideCredentials",
+                    "username": self.proxy_username,
+                    "password": self.proxy_password,
+                }
+                print(f"[cdp_publish] Responding to {source or 'proxy'} authentication challenge.")
+            else:
+                response = {"response": "Default"}
+            self._send_cdp_nowait(
+                "Fetch.continueWithAuth",
+                {
+                    "requestId": request_id,
+                    "authChallengeResponse": response,
+                },
+            )
+            return True
+
+        if method == "Fetch.requestPaused":
+            request_id = params.get("requestId")
+            if isinstance(request_id, str):
+                self._send_cdp_nowait("Fetch.continueRequest", {"requestId": request_id})
+            return True
+
+        return False
+
+    def _recv_cdp_message(self, timeout: float) -> dict[str, Any] | None:
+        raw = self.ws.recv(timeout=timeout)
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise CDPError(f"Received invalid CDP JSON: {exc}") from exc
+        if self._handle_cdp_event(data):
+            return None
+        return data
 
     def _send(
         self,
@@ -718,7 +894,7 @@ class XiaohongshuPublisher:
                 )
 
             try:
-                raw = self.ws.recv(timeout=max(0.1, remaining))
+                data = self._recv_cdp_message(timeout=max(0.1, remaining))
             except TimeoutError as exc:
                 raise CDPError(
                     f"Timed out waiting for CDP response to {method} "
@@ -727,12 +903,8 @@ class XiaohongshuPublisher:
             except Exception as exc:
                 raise CDPError(f"CDP receive failed while waiting for {method}: {exc}") from exc
 
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError as exc:
-                raise CDPError(
-                    f"Received invalid CDP JSON while waiting for {method}: {exc}"
-                ) from exc
+            if data is None:
+                continue
 
             if data.get("id") == message_id:
                 if "error" in data:
@@ -873,11 +1045,11 @@ class XiaohongshuPublisher:
         while time.time() < deadline:
             timeout = min(1.0, max(0.1, deadline - time.time()))
             try:
-                raw = self.ws.recv(timeout=timeout)
+                message = self._recv_cdp_message(timeout=timeout)
             except TimeoutError:
                 continue
-
-            message = json.loads(raw)
+            if message is None:
+                continue
             method = message.get("method")
             params = message.get("params", {})
 
@@ -1460,11 +1632,11 @@ class XiaohongshuPublisher:
         while time.time() < deadline:
             timeout = min(1.0, max(0.1, deadline - time.time()))
             try:
-                raw = self.ws.recv(timeout=timeout)
+                message = self._recv_cdp_message(timeout=timeout)
             except TimeoutError:
                 continue
-
-            message = json.loads(raw)
+            if message is None:
+                continue
             method = message.get("method")
             params = message.get("params", {})
 
@@ -3277,11 +3449,11 @@ class XiaohongshuPublisher:
         while time.time() < deadline:
             timeout = min(1.0, max(0.1, deadline - time.time()))
             try:
-                raw = self.ws.recv(timeout=timeout)
+                message = self._recv_cdp_message(timeout=timeout)
             except TimeoutError:
                 continue
-
-            message = json.loads(raw)
+            if message is None:
+                continue
             method = message.get("method")
             params = message.get("params", {})
 
@@ -3434,26 +3606,130 @@ class XiaohongshuPublisher:
         """)
         return int(count or 0)
 
-    def _wait_for_uploaded_images(self, expected_count: int, timeout_seconds: float = 60.0):
-        """Wait until image preview count reaches the expected value."""
+    def _get_image_upload_state(self, expected_count: int) -> dict[str, Any]:
+        """Return current image upload progress signals from the creator page."""
+        state = self._evaluate(f"""
+            (() => {{
+                const previewSelectors = [
+                    {json.dumps(SELECTORS["image_preview_items"])},
+                    ".img-preview-area [class*='preview']",
+                    ".draggable-item",
+                    "[class*='img-preview'] .pr"
+                ];
+                const busySelectors = [
+                    "[aria-busy='true']",
+                    "[role='progressbar']",
+                    "[class*='uploading']",
+                    "[class*='loading']",
+                    "[class*='spin']",
+                    "[class*='progress']",
+                    "[class*='percent']"
+                ];
+                const visible = (node) => {{
+                    if (!(node instanceof HTMLElement)) return false;
+                    const rect = node.getBoundingClientRect();
+                    const style = getComputedStyle(node);
+                    return (
+                        rect.width > 0 &&
+                        rect.height > 0 &&
+                        style.display !== "none" &&
+                        style.visibility !== "hidden" &&
+                        Number(style.opacity || 1) !== 0
+                    );
+                }};
+
+                let count = 0;
+                for (const selector of previewSelectors) {{
+                    try {{
+                        count = Math.max(count, document.querySelectorAll(selector).length);
+                    }} catch (error) {{}}
+                }}
+
+                const busyTextRe = /上传中|正在上传|处理中|加载中|导入中|转码|uploading|processing|loading|\\d{{1,3}}\\s*%/i;
+                const failedTextRe = /上传失败|失败|错误|重试|failed|error|retry/i;
+                const busyNodes = [];
+                const failedNodes = [];
+                const seen = new Set();
+
+                for (const selector of busySelectors) {{
+                    for (const node of document.querySelectorAll(selector)) {{
+                        if (seen.has(node) || !visible(node)) continue;
+                        seen.add(node);
+                        const text = String(node.innerText || node.textContent || "").replace(/\\s+/g, " ").trim();
+                        const className = String(node.className || "");
+                        if (
+                            node.getAttribute("aria-busy") === "true" ||
+                            node.getAttribute("role") === "progressbar" ||
+                            busyTextRe.test(text) ||
+                            /uploading|loading|spin|progress|percent/i.test(className)
+                        ) {{
+                            busyNodes.push((text || className).slice(0, 120));
+                        }}
+                        if (failedTextRe.test(text)) {{
+                            failedNodes.push(text.slice(0, 120));
+                        }}
+                    }}
+                }}
+
+                const bodyText = String(document.body && document.body.innerText || "")
+                    .replace(/\\s+/g, " ");
+                if (failedTextRe.test(bodyText)) {{
+                    const match = bodyText.match(/(.{{0,40}}(?:上传失败|失败|错误|重试|failed|error|retry).{{0,80}})/i);
+                    if (match) failedNodes.push(match[1]);
+                }}
+
+                return {{
+                    count,
+                    expected: {int(expected_count)},
+                    busy: busyNodes.length > 0,
+                    failed: failedNodes.length > 0,
+                    busyHints: busyNodes.slice(0, 5),
+                    failedHints: failedNodes.slice(0, 5),
+                }};
+            }})()
+        """)
+        return state if isinstance(state, dict) else {}
+
+    def _wait_for_uploaded_images(self, expected_count: int, timeout_seconds: float = 180.0):
+        """Wait until image previews are present and upload progress has settled."""
         deadline = time.time() + max(5.0, float(timeout_seconds))
-        last_count = -1
+        last_status = ""
         while time.time() < deadline:
-            current_count = self._count_uploaded_images()
-            if current_count != last_count:
+            state = self._get_image_upload_state(expected_count)
+            current_count = int(state.get("count") or 0)
+            busy = bool(state.get("busy"))
+            failed = bool(state.get("failed"))
+            status = f"{current_count}/{expected_count}, busy={busy}"
+            if status != last_status:
                 print(
-                    "[cdp_publish] Waiting for uploaded image previews: "
-                    f"{current_count}/{expected_count}"
+                    "[cdp_publish] Waiting for image upload to settle: "
+                    f"{status}"
                 )
-                last_count = current_count
-            if current_count >= expected_count:
+                last_status = status
+            if failed:
+                hints = state.get("failedHints") or []
+                raise CDPError(
+                    "Image upload failed on the creator page. "
+                    f"Details: {hints}"
+                )
+            if current_count >= expected_count and not busy:
                 return
             self._sleep(0.5, minimum_seconds=0.15)
 
         raise CDPError(
-            f"Timed out waiting for image upload preview {expected_count}. "
+            f"Timed out waiting for image upload {expected_count} to finish. "
             "The creator page structure may have changed."
         )
+
+    def _wait_for_content_editor_ready(self, timeout_seconds: float = 120.0) -> str:
+        """Wait until the content editor is mounted after media upload."""
+        deadline = time.time() + max(5.0, float(timeout_seconds))
+        while time.time() < deadline:
+            selector = self._find_content_editor_selector()
+            if selector:
+                return selector
+            self._sleep(0.5, minimum_seconds=0.15)
+        raise CDPError("Timed out waiting for content editor after image upload.")
 
     def _find_content_editor_selector(self) -> str | None:
         """Return the best available content editor selector for the current page."""
@@ -3864,7 +4140,10 @@ class XiaohongshuPublisher:
             self._wait_for_uploaded_images(index)
             self._sleep(0.9, minimum_seconds=0.25)
 
+        print("[cdp_publish] Images submitted. Waiting for all uploads to finish...")
+        self._wait_for_uploaded_images(len(prepared_paths), timeout_seconds=240.0)
         print("[cdp_publish] Images uploaded. Waiting for editor to appear...")
+        self._wait_for_content_editor_ready(timeout_seconds=120.0)
         self._sleep(UPLOAD_WAIT, minimum_seconds=2.0)
 
     def _upload_video(self, video_path: str):
@@ -3933,7 +4212,7 @@ class XiaohongshuPublisher:
                 print(f"[cdp_publish] Video processing: {pct}")
                 last_pct = pct
 
-            time.sleep(VIDEO_PROCESS_POLL)
+            self._sleep(VIDEO_PROCESS_POLL, minimum_seconds=0.4)
 
         raise CDPError(
             f"Video processing did not complete within {VIDEO_PROCESS_TIMEOUT}s. "
@@ -4410,7 +4689,7 @@ class XiaohongshuPublisher:
         """)
         return snapshot if isinstance(snapshot, dict) else {}
 
-    def _wait_for_publish_completion(self, timeout_seconds: float = 120.0) -> str | None:
+    def _wait_for_publish_completion(self, timeout_seconds: float = 300.0) -> str | None:
         """Wait until the page shows a real publish success signal."""
         deadline = time.time() + max(5.0, float(timeout_seconds))
         last_snapshot: dict[str, Any] = {}
@@ -4493,7 +4772,7 @@ class XiaohongshuPublisher:
         print("[cdp_publish] Clicking publish button...")
         self._dismiss_publish_overlays()
         self._sleep(ACTION_INTERVAL, minimum_seconds=0.25)
-        self._wait_for_publish_button_ready(timeout_seconds=20.0)
+        self._wait_for_publish_button_ready(timeout_seconds=90.0)
         rect = self._get_publish_button_rect()
         if not rect:
             raise CDPError(
@@ -4518,7 +4797,7 @@ class XiaohongshuPublisher:
             print("[cdp_publish] Publish page did not react to CDP click; trying DOM fallback...")
             self._click_publish_button_dom_fallback()
 
-        return self._wait_for_publish_completion(timeout_seconds=120.0)
+        return self._wait_for_publish_completion(timeout_seconds=300.0)
 
     # ------------------------------------------------------------------
     # Main publish workflow
@@ -4675,6 +4954,16 @@ def main():
             "Windows/UNC paths are auto-detected by default."
         ),
     )
+    parser.add_argument(
+        "--proxy-server",
+        default=None,
+        help=(
+            "Chrome proxy server for local browser launch, "
+            "e.g. http://127.0.0.1:7890. Ignored in remote CDP mode."
+        ),
+    )
+    parser.add_argument("--proxy-username", default=None, help="Proxy authentication username")
+    parser.add_argument("--proxy-password", default=None, help="Proxy authentication password")
     sub = parser.add_subparsers(dest="command", required=True)
 
     # check-login
@@ -4943,6 +5232,26 @@ def main():
     account = args.account
     cache_account_name = _resolve_account_name(account)
     reuse_existing_tab = args.reuse_existing_tab
+    default_proxy = _load_default_proxy_options()
+    raw_proxy_server = (
+        args.proxy_server
+        if args.proxy_server is not None
+        else default_proxy["server"]
+    )
+    raw_proxy_username = (
+        args.proxy_username
+        if args.proxy_username is not None
+        else default_proxy["username"]
+    )
+    raw_proxy_password = (
+        args.proxy_password
+        if args.proxy_password is not None
+        else default_proxy["password"]
+    )
+    proxy_parts = _split_proxy_auth(raw_proxy_server)
+    proxy_server = proxy_parts["server"]
+    proxy_username = raw_proxy_username or proxy_parts["username"]
+    proxy_password = raw_proxy_password or proxy_parts["password"]
     timing_jitter = _normalize_timing_jitter(args.timing_jitter)
     local_mode = _is_local_host(host)
 
@@ -5000,7 +5309,12 @@ def main():
         headless = False
 
     if local_mode:
-        if not ensure_chrome(port=port, headless=headless, account=account):
+        if not ensure_chrome(
+            port=port,
+            headless=headless,
+            account=account,
+            proxy_server=proxy_server,
+        ):
             print("Failed to start Chrome. Exiting.")
             sys.exit(1)
     else:
@@ -5013,6 +5327,11 @@ def main():
     print(f"[cdp_publish] Login cache: enabled (ttl={DEFAULT_LOGIN_CACHE_TTL_HOURS:g}h).")
     if reuse_existing_tab:
         print("[cdp_publish] Tab selection mode: prefer reusing existing tab.")
+    if proxy_server:
+        proxy_note = "local Chrome launch" if local_mode else "ignored in remote CDP mode"
+        print(f"[cdp_publish] Chrome proxy server: {proxy_server} ({proxy_note}).")
+    if proxy_username or proxy_password:
+        print("[cdp_publish] Proxy authentication: enabled.")
 
     publisher = XiaohongshuPublisher(
         host=host,
@@ -5020,6 +5339,9 @@ def main():
         timing_jitter=timing_jitter,
         account_name=cache_account_name,
         preserve_upload_paths=args.preserve_upload_paths,
+        proxy_server=proxy_server,
+        proxy_username=proxy_username,
+        proxy_password=proxy_password,
     )
     try:
         if args.command == "check-login":
@@ -5290,7 +5612,12 @@ def main():
         elif args.command == "login":
             # Ensure headed mode for QR scanning
             if local_mode:
-                restart_chrome(port=port, headless=False, account=account)
+                restart_chrome(
+                    port=port,
+                    headless=False,
+                    account=account,
+                    proxy_server=proxy_server,
+                )
             publisher.connect(reuse_existing_tab=reuse_existing_tab)
             publisher.open_login_page()
             print("LOGIN_READY")
@@ -5298,7 +5625,12 @@ def main():
         elif args.command == "re-login":
             # Ensure headed mode, clear cookies, re-open login page for same account
             if local_mode:
-                restart_chrome(port=port, headless=False, account=account)
+                restart_chrome(
+                    port=port,
+                    headless=False,
+                    account=account,
+                    proxy_server=proxy_server,
+                )
             publisher.connect(reuse_existing_tab=reuse_existing_tab)
             publisher.clear_cookies()
             publisher._sleep(1, minimum_seconds=0.5)
@@ -5308,7 +5640,12 @@ def main():
         elif args.command == "switch-account":
             # Ensure headed mode, clear cookies, open login page
             if local_mode:
-                restart_chrome(port=port, headless=False, account=account)
+                restart_chrome(
+                    port=port,
+                    headless=False,
+                    account=account,
+                    proxy_server=proxy_server,
+                )
             publisher.connect(reuse_existing_tab=reuse_existing_tab)
             publisher.clear_cookies()
             publisher._sleep(1, minimum_seconds=0.5)

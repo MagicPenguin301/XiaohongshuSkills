@@ -51,6 +51,7 @@ import random
 import re
 import sys
 import time
+from urllib.parse import unquote, urlparse, urlunparse
 
 # Ensure UTF-8 output on Windows consoles
 if sys.platform == "win32":
@@ -83,6 +84,30 @@ def _normalize_timing_jitter(value: float) -> float:
 def _is_local_host(host: str) -> bool:
     """Return True when host points to the local machine."""
     return host.strip().lower() in {"127.0.0.1", "localhost", "::1"}
+
+
+def _split_proxy_auth(proxy_server: str | None) -> dict[str, str | None]:
+    """Return Chrome-safe proxy server plus optional auth from a proxy URL."""
+    proxy = str(proxy_server or "").strip()
+    if not proxy:
+        return {"server": None, "username": None, "password": None}
+
+    parsed = urlparse(proxy)
+    if not parsed.scheme or not parsed.netloc or parsed.username is None:
+        return {"server": proxy, "username": None, "password": None}
+
+    host = parsed.hostname or ""
+    if not host:
+        return {"server": proxy, "username": None, "password": None}
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
+    server = urlunparse((parsed.scheme, netloc, "", "", "", ""))
+    return {
+        "server": server,
+        "username": unquote(parsed.username),
+        "password": unquote(parsed.password or ""),
+    }
 
 
 def _resolve_account_name(account_name: str | None) -> str:
@@ -184,6 +209,9 @@ def _select_topics(
     if not tags:
         return
 
+    if hasattr(publisher, "_wait_for_content_editor_ready"):
+        publisher._wait_for_content_editor_ready(timeout_seconds=120.0)
+
     print(f"[pipeline] Step 4.1: Selecting {len(tags)} topic tag(s)...")
     failed_tags = []
 
@@ -195,8 +223,8 @@ def _select_topics(
         hash_pause_ms = _jitter_ms(180, timing_jitter, minimum_ms=90)
         char_delay_min_ms = _jitter_ms(45, timing_jitter, minimum_ms=25)
         char_delay_max_ms = _jitter_ms(95, timing_jitter, minimum_ms=char_delay_min_ms)
-        suggest_wait_ms = _jitter_ms(3000, timing_jitter, minimum_ms=1600)
-        after_enter_ms = _jitter_ms(260, timing_jitter, minimum_ms=120)
+        suggest_wait_ms = _jitter_ms(5000, timing_jitter, minimum_ms=2600)
+        after_enter_ms = _jitter_ms(900, timing_jitter, minimum_ms=500)
 
         escaped_tag = json.dumps(normalized_tag)
         newline_literal = json.dumps("\n")
@@ -218,15 +246,17 @@ def _select_topics(
                 function moveCaretToEditorEnd(el) {{
                     el.focus();
                     var selection = window.getSelection();
-                    if (!selection) return;
+                    if (!selection) return false;
                     var range = document.createRange();
                     range.selectNodeContents(el);
                     range.collapse(false);
                     selection.removeAllRanges();
                     selection.addRange(range);
+                    return true;
                 }}
 
                 function insertTextAtCaret(text) {{
+                    moveCaretToEditorEnd(editor);
                     var inserted = false;
                     try {{
                         inserted = document.execCommand('insertText', false, text);
@@ -249,6 +279,26 @@ def _select_topics(
                     editor.dispatchEvent(new Event('input', {{ bubbles: true }}));
                 }}
 
+                function countTopicTokens() {{
+                    var nodes = editor.querySelectorAll(
+                        '[contenteditable="false"], [data-type*="topic"], [class*="topic"], [class*="tag"], a'
+                    );
+                    var count = 0;
+                    for (var i = 0; i < nodes.length; i++) {{
+                        var text = String(nodes[i].innerText || nodes[i].textContent || '').trim();
+                        var className = String(nodes[i].className || '');
+                        var marker = String(nodes[i].getAttribute('data-type') || '');
+                        if (
+                            text.indexOf('#') >= 0 ||
+                            /topic|tag/i.test(className) ||
+                            /topic|tag/i.test(marker)
+                        ) {{
+                            count += 1;
+                        }}
+                    }}
+                    return count;
+                }}
+
                 function pressEnter(el) {{
                     var evt = {{
                         key: 'Enter',
@@ -263,6 +313,7 @@ def _select_topics(
                     el.dispatchEvent(new KeyboardEvent('keyup', evt));
                 }}
 
+                var beforeTopicCount = countTopicTokens();
                 moveCaretToEditorEnd(editor);
                 if ({index} === 0) {{
                     insertTextAtCaret({newline_literal});
@@ -274,16 +325,25 @@ def _select_topics(
                 var charDelayMin = {char_delay_min_ms};
                 var charDelayMax = {char_delay_max_ms};
                 for (var i = 0; i < tagText.length; i++) {{
+                    moveCaretToEditorEnd(editor);
                     insertTextAtCaret(tagText[i]);
                     var charDelay = Math.floor(Math.random() * (charDelayMax - charDelayMin + 1)) + charDelayMin;
                     await sleep(charDelay);
                 }}
 
                 await sleep({suggest_wait_ms});
+                moveCaretToEditorEnd(editor);
                 pressEnter(editor);
                 await sleep({after_enter_ms});
+                var afterTopicCount = countTopicTokens();
+                moveCaretToEditorEnd(editor);
                 insertTextAtCaret({space_literal});
-                return {{ ok: true, selected: true }};
+                return {{
+                    ok: true,
+                    selected: true,
+                    topicCountBefore: beforeTopicCount,
+                    topicCountAfter: afterTopicCount,
+                }};
             }})()
         """)
 
@@ -394,6 +454,8 @@ def main():
             "e.g. http://127.0.0.1:7890. Ignored in remote CDP mode."
         ),
     )
+    parser.add_argument("--proxy-username", default=None, help="Proxy authentication username")
+    parser.add_argument("--proxy-password", default=None, help="Proxy authentication password")
 
     # Optional temp dir for downloaded images
     parser.add_argument(
@@ -448,7 +510,10 @@ def main():
     account = args.account
     cache_account_name = _resolve_account_name(account)
     reuse_existing_tab = args.reuse_existing_tab
-    proxy_server = args.proxy_server
+    proxy_parts = _split_proxy_auth(args.proxy_server)
+    proxy_server = proxy_parts["server"]
+    proxy_username = args.proxy_username or proxy_parts["username"]
+    proxy_password = args.proxy_password or proxy_parts["password"]
     timing_jitter = _normalize_timing_jitter(args.timing_jitter)
     local_mode = _is_local_host(host)
     post_time = args.post_time
@@ -501,6 +566,8 @@ def main():
     if proxy_server:
         proxy_note = "local Chrome launch" if local_mode else "ignored in remote CDP mode"
         print(f"[pipeline] Chrome proxy server: {proxy_server} ({proxy_note}).")
+    if proxy_username or proxy_password:
+        print("[pipeline] Proxy authentication: enabled.")
     if local_mode:
         if not ensure_chrome(
             port=port,
@@ -524,6 +591,9 @@ def main():
         timing_jitter=timing_jitter,
         account_name=cache_account_name,
         preserve_upload_paths=args.preserve_upload_paths,
+        proxy_server=proxy_server,
+        proxy_username=proxy_username,
+        proxy_password=proxy_password,
     )
     try:
         publisher.connect(reuse_existing_tab=reuse_existing_tab)

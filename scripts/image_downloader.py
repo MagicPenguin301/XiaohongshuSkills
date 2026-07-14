@@ -14,7 +14,7 @@ from urllib.parse import urlparse, unquote
 
 import requests
 
-DEFAULT_TIMEOUT = 30  # seconds per download
+DEFAULT_TIMEOUT = 90  # seconds per download
 TEMP_DIR_PREFIX = "xhs_images_"
 
 
