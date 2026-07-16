@@ -364,6 +364,135 @@ def _select_topics(
         )
 
 
+def _select_collection(
+    publisher: XiaohongshuPublisher,
+    collection_name: str | None,
+    timing_jitter: float = 0.25,
+):
+    """Open the collection menu and select the named collection."""
+    collection_name = str(collection_name or "").strip()
+    if not collection_name:
+        return
+
+    if hasattr(publisher, "_wait_for_content_editor_ready"):
+        publisher._wait_for_content_editor_ready(timeout_seconds=120.0)
+
+    print(f"[pipeline] Step 4.2: Selecting collection: {collection_name}")
+    button_result = publisher._evaluate("""
+        (function() {
+            function visible(el) {
+                if (!el) return false;
+                var rect = el.getBoundingClientRect();
+                var style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0
+                    && style.visibility !== 'hidden'
+                    && style.display !== 'none';
+            }
+            var selectors = [
+                '.collection-plugin-button',
+                '[class*="collection-plugin-button"]',
+                'button',
+                '[role="button"]'
+            ];
+            var candidates = [];
+            selectors.forEach(function(selector) {
+                document.querySelectorAll(selector).forEach(function(el) {
+                    if (candidates.indexOf(el) === -1) candidates.push(el);
+                });
+            });
+            for (var i = 0; i < candidates.length; i++) {
+                var el = candidates[i];
+                var text = String(el.innerText || el.textContent || '').trim();
+                var className = String(el.className || '');
+                if (visible(el) && (className.indexOf('collection-plugin-button') >= 0 || text.indexOf('选择合集') >= 0)) {
+                    var rect = el.getBoundingClientRect();
+                    return { ok: true, rect: { x: rect.x, y: rect.y, width: rect.width, height: rect.height } };
+                }
+            }
+            return { ok: false, reason: 'button_not_found' };
+        })()
+    """)
+    if not (isinstance(button_result, dict) and button_result.get("ok")):
+        reason = button_result.get("reason") if isinstance(button_result, dict) else "unknown"
+        print(f"[pipeline] Warning: Could not find collection button ({reason}).")
+        return
+
+    _click_rect(publisher, button_result["rect"])
+    time.sleep(_jitter_seconds(0.8, timing_jitter, minimum_seconds=0.4))
+
+    target_literal = json.dumps(collection_name)
+    item_result = publisher._evaluate(f"""
+        (function() {{
+            var target = {target_literal};
+            function norm(value) {{
+                return String(value || '').replace(/\\s+/g, '').trim();
+            }}
+            function visible(el) {{
+                if (!el) return false;
+                var rect = el.getBoundingClientRect();
+                var style = window.getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0
+                    && style.visibility !== 'hidden'
+                    && style.display !== 'none';
+            }}
+            var roots = Array.prototype.slice.call(document.querySelectorAll(
+                '.collection-plugin-popover, [class*="collection-plugin-popover"], .d-popover'
+            )).filter(visible);
+            if (!roots.length) roots = [document.body];
+
+            var options = [];
+            for (var r = 0; r < roots.length; r++) {{
+                var nodes = roots[r].querySelectorAll(
+                    '.item-label, [class*="item-label"], .item, [class*="item"]'
+                );
+                for (var i = 0; i < nodes.length; i++) {{
+                    var node = nodes[i];
+                    if (!visible(node)) continue;
+                    var text = String(node.innerText || node.textContent || '').replace('创建合集', '').trim();
+                    if (!text) continue;
+                    if (options.indexOf(text) === -1) options.push(text);
+                    if (norm(text) === norm(target)) {{
+                        var clickable = node.closest('.item, [class*="item"]') || node;
+                        var rect = clickable.getBoundingClientRect();
+                        return {{
+                            ok: true,
+                            rect: {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }},
+                            options: options
+                        }};
+                    }}
+                }}
+            }}
+            return {{ ok: false, reason: 'collection_not_found', options: options }};
+        }})()
+    """)
+    if not (isinstance(item_result, dict) and item_result.get("ok")):
+        options = item_result.get("options") if isinstance(item_result, dict) else []
+        suffix = f" Available: {', '.join(options)}" if options else ""
+        print(f"[pipeline] Warning: Could not find collection '{collection_name}'.{suffix}")
+        return
+
+    _click_rect(publisher, item_result["rect"])
+    time.sleep(_jitter_seconds(0.5, timing_jitter, minimum_seconds=0.25))
+    print(f"[pipeline] Collection selected: {collection_name}")
+
+
+def _click_rect(publisher: XiaohongshuPublisher, rect: dict):
+    cx = rect["x"] + rect["width"] / 2
+    cy = rect["y"] + rect["height"] / 2
+    if hasattr(publisher, "_click_mouse"):
+        publisher._click_mouse(cx, cy)
+        return
+    for event_type in ("mousePressed", "mouseReleased"):
+        publisher._send("Input.dispatchMouseEvent", {
+            "type": event_type,
+            "x": cx,
+            "y": cy,
+            "button": "left",
+            "clickCount": 1,
+        })
+        time.sleep(0.05)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Xiaohongshu publish pipeline - unified entry point"
@@ -384,6 +513,11 @@ def main():
         "--post-time",
         default=None,
         help="Timer for publishing on note",
+    )
+    parser.add_argument(
+        "--collection",
+        default=None,
+        help="Collection name to select after filling the note, e.g. Agent篇",
     )
 
     # Media: images OR video (mutually exclusive)
@@ -677,6 +811,7 @@ def main():
                 title=title, content=content, image_paths=image_paths, post_time=post_time
             )
         _select_topics(publisher, topic_tags, timing_jitter=timing_jitter)
+        _select_collection(publisher, args.collection, timing_jitter=timing_jitter)
         print("FILL_STATUS: READY_TO_PUBLISH")
     except CDPError as e:
         print(f"Error during form fill: {e}", file=sys.stderr)
