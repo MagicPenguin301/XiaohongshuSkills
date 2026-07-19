@@ -422,10 +422,13 @@ def _select_collection(
 
     target_literal = json.dumps(collection_name)
     item_result = publisher._evaluate(f"""
-        (function() {{
+        (async function() {{
             var target = {target_literal};
             function norm(value) {{
                 return String(value || '').replace(/\\s+/g, '').trim();
+            }}
+            function delay(ms) {{
+                return new Promise(function(resolve) {{ setTimeout(resolve, ms); }});
             }}
             function visible(el) {{
                 if (!el) return false;
@@ -435,32 +438,93 @@ def _select_collection(
                     && style.visibility !== 'hidden'
                     && style.display !== 'none';
             }}
-            var roots = Array.prototype.slice.call(document.querySelectorAll(
-                '.collection-plugin-popover, [class*="collection-plugin-popover"], .d-popover'
-            )).filter(visible);
-            if (!roots.length) roots = [document.body];
-
             var options = [];
-            for (var r = 0; r < roots.length; r++) {{
-                var nodes = roots[r].querySelectorAll(
+            function roots() {{
+                var found = Array.prototype.slice.call(document.querySelectorAll(
+                    '.collection-plugin-popover, [class*="collection-plugin-popover"], .d-popover'
+                )).filter(visible);
+                return found.length ? found : [document.body];
+            }}
+            function rememberOption(text) {{
+                if (text && options.indexOf(text) === -1) options.push(text);
+            }}
+            function optionText(node) {{
+                return String(node.innerText || node.textContent || '').replace('创建合集', '').trim();
+            }}
+            function candidateNodes(root) {{
+                return Array.prototype.slice.call(root.querySelectorAll(
                     '.item-label, [class*="item-label"], .item, [class*="item"]'
-                );
-                for (var i = 0; i < nodes.length; i++) {{
-                    var node = nodes[i];
-                    if (!visible(node)) continue;
-                    var text = String(node.innerText || node.textContent || '').replace('创建合集', '').trim();
-                    if (!text) continue;
-                    if (options.indexOf(text) === -1) options.push(text);
-                    if (norm(text) === norm(target)) {{
-                        var clickable = node.closest('.item, [class*="item"]') || node;
-                        var rect = clickable.getBoundingClientRect();
-                        return {{
-                            ok: true,
-                            rect: {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }},
-                            options: options
-                        }};
+                ));
+            }}
+            function clickElement(el) {{
+                var rect = el.getBoundingClientRect();
+                var init = {{
+                    bubbles: true,
+                    cancelable: true,
+                    view: window,
+                    clientX: rect.left + rect.width / 2,
+                    clientY: rect.top + rect.height / 2
+                }};
+                el.dispatchEvent(new MouseEvent('mousedown', init));
+                el.dispatchEvent(new MouseEvent('mouseup', init));
+                el.dispatchEvent(new MouseEvent('click', init));
+                if (typeof el.click === 'function') el.click();
+                return {{ x: rect.x, y: rect.y, width: rect.width, height: rect.height }};
+            }}
+            function findTarget() {{
+                var currentRoots = roots();
+                for (var r = 0; r < currentRoots.length; r++) {{
+                    var nodes = candidateNodes(currentRoots[r]);
+                    for (var i = 0; i < nodes.length; i++) {{
+                        var node = nodes[i];
+                        var text = optionText(node);
+                        if (!text) continue;
+                        if (visible(node)) rememberOption(text);
+                        if (norm(text) === norm(target)) {{
+                            var clickable = node.closest('.item, [class*="item"]') || node;
+                            clickable.scrollIntoView({{ block: 'center', inline: 'nearest' }});
+                            return clickable;
+                        }}
                     }}
                 }}
+                return null;
+            }}
+            function scrollContainers() {{
+                var containers = [];
+                roots().forEach(function(root) {{
+                    containers.push(root);
+                    root.querySelectorAll('*').forEach(function(el) {{
+                        if (el.scrollHeight > el.clientHeight + 4) containers.push(el);
+                    }});
+                }});
+                return containers.filter(function(el, index) {{
+                    return containers.indexOf(el) === index && visible(el);
+                }});
+            }}
+
+            var direct = findTarget();
+            if (direct) {{
+                await delay(80);
+                return {{ ok: true, clicked: true, rect: clickElement(direct), options: options }};
+            }}
+
+            var containers = scrollContainers();
+            for (var c = 0; c < containers.length; c++) {{
+                var el = containers[c];
+                var maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
+                if (!maxScroll) continue;
+                var originalTop = el.scrollTop;
+                var steps = 8;
+                for (var step = 0; step <= steps; step++) {{
+                    el.scrollTop = Math.round(maxScroll * step / steps);
+                    await delay(120);
+                    var targetEl = findTarget();
+                    if (targetEl) {{
+                        await delay(80);
+                        return {{ ok: true, clicked: true, rect: clickElement(targetEl), options: options }};
+                    }}
+                }}
+                el.scrollTop = originalTop;
             }}
             return {{ ok: false, reason: 'collection_not_found', options: options }};
         }})()
@@ -471,7 +535,8 @@ def _select_collection(
         print(f"[pipeline] Warning: Could not find collection '{collection_name}'.{suffix}")
         return
 
-    _click_rect(publisher, item_result["rect"])
+    if not item_result.get("clicked"):
+        _click_rect(publisher, item_result["rect"])
     time.sleep(_jitter_seconds(0.5, timing_jitter, minimum_seconds=0.25))
     print(f"[pipeline] Collection selected: {collection_name}")
 

@@ -31,6 +31,30 @@ _current_account: Optional[str] = None
 def get_chrome_path() -> str:
     """Find Chrome executable on Windows/macOS/Linux."""
     candidates = []
+    env_path = os.environ.get("CHROME_EXECUTABLE_PATH") or os.environ.get("CHROMIUM_EXECUTABLE_PATH")
+    if env_path:
+        candidates.append(os.path.expanduser(env_path))
+
+    conda_prefix = os.environ.get("CONDA_PREFIX")
+    if conda_prefix:
+        if sys.platform == "win32":
+            candidates.extend(
+                [
+                    os.path.join(conda_prefix, "Library", "bin", "chrome.exe"),
+                    os.path.join(conda_prefix, "Library", "bin", "chromium.exe"),
+                    os.path.join(conda_prefix, "Scripts", "chrome.exe"),
+                    os.path.join(conda_prefix, "Scripts", "chromium.exe"),
+                ]
+            )
+        else:
+            candidates.extend(
+                [
+                    os.path.join(conda_prefix, "bin", "chromium"),
+                    os.path.join(conda_prefix, "bin", "chromium-browser"),
+                    os.path.join(conda_prefix, "bin", "google-chrome"),
+                    os.path.join(conda_prefix, "bin", "chrome"),
+                ]
+            )
 
     if sys.platform == "win32":
         for env_var in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
@@ -57,7 +81,7 @@ def get_chrome_path() -> str:
         )
 
     for path in candidates:
-        if os.path.isfile(path):
+        if path and os.path.isfile(path):
             return path
 
     import shutil
